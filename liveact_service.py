@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+"""
+Live ACT的服务，本工程的入口
+"""
 import os
 import argparse
 import threading
@@ -17,7 +21,7 @@ from PIL import Image
 from flask import Flask, render_template_string, send_from_directory, jsonify, request, render_template
 
 from lightx2v.models.video_encoders.hf.wan.vae import WanVAE as LightVAE
-from util_liveact import center_rescale_crop_keep_ratio, get_embedding, get_msk, get_audio_emb
+from util_liveact import center_rescale_crop_keep_ratio, get_embedding, get_msk, get_audio_emb, add_audio_to_video
 from wan.modules.clip import CLIPModel
 from wan.modules.t5 import T5EncoderModel
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
@@ -173,7 +177,7 @@ class DistributedVideoEngine:
         # 初始化KV Cache
         self.blksz_lst = [6, 8]
         self.frame_len = (self.height // (self.patch_size[1] * self.vae_stride[1])) * (
-                    self.width // (self.patch_size[2] * self.vae_stride[2]))
+                self.width // (self.patch_size[2] * self.vae_stride[2]))
         kv_cache_tokens = self.frame_len * sum(self.blksz_lst) // self.world_size
         kv_cache_device = self.device
         kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
@@ -354,6 +358,7 @@ class DistributedVideoEngine:
         task_id = params['task_id']
         main_prompt = params['main_prompt']
         stream_with_audio = bool(params.get('stream_with_audio', False))
+        output_mode = params.get('output_mode', 'stream')  # 优先使用请求中的
 
         task_hls_dir = os.path.join(HLS_ROOT, task_id)
         final_video_path = os.path.join(self.video_save_root, f"{task_id}.mp4")
@@ -397,10 +402,10 @@ class DistributedVideoEngine:
             """
             video_u8 = (
                 ((video_tensor.squeeze(0).permute(1, 2, 3, 0) + 1.0) * 127.5)
-                .clamp(0, 255)
-                .to(torch.uint8)
-                .contiguous()
-                .cpu()
+                    .clamp(0, 255)
+                    .to(torch.uint8)
+                    .contiguous()
+                    .cpu()
             )  # [T, H, W, C], uint8
             num_frames = video_u8.shape[0]
             chunk_bytes = video_u8.numpy().tobytes()
@@ -500,11 +505,6 @@ class DistributedVideoEngine:
                 ]
 
                 print(f"[Generate][{task_id}] hls_ffmpeg_cmd = {' '.join(map(str, hls_ffmpeg_cmd))}", flush=True)
-                hls_ffmpeg_process = subprocess.Popen(
-                    hls_ffmpeg_cmd,
-                    stdin=subprocess.PIPE,
-                    bufsize=0
-                )
 
                 # ---------- 保存 mp4 ffmpeg ----------
                 # 直接带音频保存，不再先写 silent.mp4 再二次 mux
@@ -538,11 +538,24 @@ class DistributedVideoEngine:
                 ]
 
                 print(f"[Generate][{task_id}] save_ffmpeg_cmd = {' '.join(map(str, save_ffmpeg_cmd))}", flush=True)
-                save_ffmpeg_process = subprocess.Popen(
-                    save_ffmpeg_cmd,
-                    stdin=subprocess.PIPE,
-                    bufsize=0
-                )
+
+                if output_mode == "stream":
+                    # 原有流式推流代码：启动 hls_ffmpeg_process 和 save_ffmpeg_process
+                    hls_ffmpeg_process = subprocess.Popen(
+                        hls_ffmpeg_cmd,
+                        stdin=subprocess.PIPE,
+                        bufsize=0
+                    )
+                    save_ffmpeg_process = subprocess.Popen(
+                        save_ffmpeg_cmd,
+                        stdin=subprocess.PIPE,
+                        bufsize=0
+                    )
+                else:
+                    # file 模式：不启动任何 ffmpeg 进程，仅准备一个列表收集视频块
+                    all_video_chunks = []   # 用于收集每个 chunk 的 tensor
+                    hls_ffmpeg_process = None
+                    save_ffmpeg_process = None
 
                 stats['ffmpeg_proc'] = time.perf_counter() - start_time
                 update_task_status(task_id, stage="ffmpeg_ready", message="推流器已启动")
@@ -699,58 +712,129 @@ class DistributedVideoEngine:
                     pre_latent = latent
 
                 if self.rank == 0:
-                    # 这里改成“整个 chunk 一次写入”
-                    chunk_bytes, num_frames_this_chunk = tensor_chunk_to_rgb_bytes(_videos)
+                    if output_mode == "stream":
+                        # 原有流式逻辑：整个 chunk 一次写入管道
+                        # 这里改成“整个 chunk 一次写入”
+                        chunk_bytes, num_frames_this_chunk = tensor_chunk_to_rgb_bytes(_videos)
 
-                    write_chunk_bytes(hls_ffmpeg_process, chunk_bytes, name="hls_ffmpeg")
-                    write_chunk_bytes(save_ffmpeg_process, chunk_bytes, name="save_ffmpeg")
+                        write_chunk_bytes(hls_ffmpeg_process, chunk_bytes, name="hls_ffmpeg")
+                        write_chunk_bytes(save_ffmpeg_process, chunk_bytes, name="save_ffmpeg")
 
-                    m3u8_path = os.path.join(task_hls_dir, M3U8_NAME)
-                    update_task_status(
-                        task_id,
-                        status="running",
-                        stage="generating",
-                        message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk",
-                        total_chunks=iter_total_num,
-                        generated_chunks=iteration + 1,
-                        is_done=False,
-                        stream_ready=os.path.exists(m3u8_path),
-                    )
+                        m3u8_path = os.path.join(task_hls_dir, M3U8_NAME)
+                        update_task_status(
+                            task_id,
+                            status="running",
+                            stage="generating",
+                            message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk",
+                            total_chunks=iter_total_num,
+                            generated_chunks=iteration + 1,
+                            is_done=False,
+                            stream_ready=os.path.exists(m3u8_path),
+                        )
 
-                    print(
-                        f"生成完成 {iteration + 1}/{iter_total_num}, "
-                        f"frames={num_frames_this_chunk}, "
-                        f"一个chunk耗时:{time.perf_counter() - start_time:.4f}s",
-                        flush=True
-                    )
+                        print(
+                            f"生成完成 {iteration + 1}/{iter_total_num}, "
+                            f"frames={num_frames_this_chunk}, "
+                            f"一个chunk耗时:{time.perf_counter() - start_time:.4f}s",
+                            flush=True
+                        )
+                    else:
+                        # 文件模式：收集视频张量到列表，稍后统一保存
+                        all_video_chunks.append(_videos.cpu())   # 移到 CPU 避免显存累积
+
+                        # 仍可更新进度（不含 stream_ready）
+                        update_task_status(
+                            task_id,
+                            status="running",
+                            stage="generating",
+                            message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk",
+                            total_chunks=iter_total_num,
+                            generated_chunks=iteration + 1,
+                            is_done=False,
+                        )
+
+                        print(
+                            f"生成完成 {iteration + 1}/{iter_total_num}, "
+                            f"一个chunk耗时:{time.perf_counter() - start_time:.4f}s (文件模式)",
+                            flush=True
+                        )
 
             # 5. 收尾
             if self.rank == 0:
-                update_task_status(
-                    task_id,
-                    status="running",
-                    stage="finalizing",
-                    message="视频生成完成，正在封装最终文件",
-                    is_done=False,
-                )
+                if output_mode == "stream":
+                    update_task_status(
+                        task_id,
+                        status="running",
+                        stage="finalizing",
+                        message="视频生成完成，正在封装最终文件",
+                        is_done=False,
+                    )
 
-                close_proc(hls_ffmpeg_process, name="hls_ffmpeg")
-                close_proc(save_ffmpeg_process, name="save_ffmpeg")
+                    close_proc(hls_ffmpeg_process, name="hls_ffmpeg")
+                    close_proc(save_ffmpeg_process, name="save_ffmpeg")
 
-                print(f"[Save] 最终视频已保存到: {final_video_path}", flush=True)
+                    print(f"[Save] 最终视频已保存到: {final_video_path}", flush=True)
 
-                update_task_status(
-                    task_id,
-                    status="finished",
-                    stage="finished",
-                    message="生成完成",
-                    total_chunks=iter_total_num,
-                    generated_chunks=iter_total_num,
-                    is_done=True,
-                    stream_ready=True,
-                    error=None,
-                    final_video_path=final_video_path,
-                )
+                    update_task_status(
+                        task_id,
+                        status="finished",
+                        stage="finished",
+                        message="生成完成",
+                        total_chunks=iter_total_num,
+                        generated_chunks=iter_total_num,
+                        is_done=True,
+                        stream_ready=True,
+                        error=None,
+                        final_video_path=final_video_path,
+                    )
+                else:
+                    # 文件模式：合并所有视频块并保存为 MP4
+                    update_task_status(
+                        task_id,
+                        status="running",
+                        stage="finalizing",
+                        message="正在合并视频并添加音频",
+                        is_done=False,
+                    )
+                    if all_video_chunks:
+                        from diffusers.utils import export_to_video
+                        import subprocess as sp
+                        # 合并所有 chunk（时间维度拼接）
+                        full_video = torch.cat(all_video_chunks, dim=2)   # [1, 3, T, H, W]
+                        # 转换为 numpy 数组，值域 [0,1]，形状 [T, H, W, 3]
+                        video_np = ((full_video.squeeze(0).permute(1, 2, 3, 0) + 1.0) / 2).clamp(0, 1).cpu().numpy()
+                        # 保存临时无声视频
+                        temp_video_path = os.path.join(task_hls_dir, "temp_no_audio.mp4")
+                        export_to_video(video_np, temp_video_path, fps=fps)
+                        # 添加音频到最终视频
+                        final_video_path = os.path.join(self.video_save_root, f"{task_id}.mp4")
+                        # 使用 ffmpeg 合并音频（需要 add_audio_to_video 函数，可从 generate.py 复制）
+                        add_audio_to_video(temp_video_path, audio_path, final_video_path)
+                        # 清理临时文件
+                        os.remove(temp_video_path)
+                        # 更新任务状态
+                        update_task_status(
+                            task_id,
+                            status="finished",
+                            stage="finished",
+                            message="生成完成",
+                            total_chunks=iter_total_num,
+                            generated_chunks=iter_total_num,
+                            is_done=True,
+                            error=None,
+                            final_video_path=final_video_path,
+                        )
+                        print(f"[Save] 最终视频已保存到: {final_video_path}", flush=True)
+                    else:
+                        # 没有任何视频块（异常情况）
+                        update_task_status(
+                            task_id,
+                            status="failed",
+                            stage="failed",
+                            message="没有生成任何视频帧",
+                            is_done=True,
+                            error="No video chunks generated",
+                        )
 
         except Exception as e:
             print(f"[Generate] 生成失败: {e}", flush=True)
@@ -840,6 +924,9 @@ def start_stream():
     prompt_json = request.form.get('prompt_json') or '[]'
     fps = request.form.get('fps')
     prompt_list = json.loads(prompt_json)
+    output_mode = request.form.get('output_mode', 'stream')  # 默认流式
+    if output_mode not in ('stream', 'file'):
+        output_mode = 'stream'  # 非法值回退
 
     stream_with_audio = str(request.form.get('stream_with_audio', 'false')).lower() in ('1', 'true', 'yes', 'on')
     img_file = request.files.get('img_file')
@@ -863,7 +950,9 @@ def start_stream():
         'fps': int(fps),
         'img_path': img_path,
         'audio_path': audio_path,
-        'stream_with_audio': stream_with_audio, }
+        'stream_with_audio': stream_with_audio,
+        'output_mode': output_mode,   # 新增
+    }
 
     update_task_status(
         task_id,
@@ -927,13 +1016,13 @@ if __name__ == '__main__':
         action="store_true",
         default=False,
         help="Whether to offload WanModel blocks to CPU between block forwards.")
-    parser.add_argument(
-        "--output_mode",
-        type=str,
-        default="stream",
-        choices=["stream", "file"],
-        help="Output mode: 'stream' for real-time HLS streaming, 'file' for offline MP4 generation"
-    )
+    # parser.add_argument(
+    #     "--output_mode",
+    #     type=str,
+    #     default="stream",
+    #     choices=["stream", "file"],
+    #     help="Output mode: 'stream' for real-time HLS streaming, 'file' for offline MP4 generation"
+    # )
     args = parser.parse_args()
 
     try:
@@ -951,3 +1040,4 @@ if __name__ == '__main__':
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+

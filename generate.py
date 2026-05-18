@@ -163,8 +163,7 @@ def generate(args):
     kv_cache_device = 'cpu' if args.offload_cache else device
     kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
     kv_scale_shape = (1, kv_cache_tokens, 40, 1)
-    kv_cache = \
-        {
+    kv_cache = {
             i: {
                 layer_id: {
                     'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
@@ -179,8 +178,7 @@ def generate(args):
             } for i in range(len(timesteps) - 1)
         }
     if args.audio_cfg > 1.0:
-        kv_cache_null_audio = \
-            {
+        kv_cache_null_audio = {
                 i: {layer_id: {
                     'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
                     'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
@@ -271,6 +269,7 @@ def generate(args):
         torch_gc()
 
         audio_ori, sr_ori = torchaudio.load(audio_path)  # y: [channels, time]
+
         def resample_audio(audio, sr, fps):
             rate = 25 / fps
             effects = [["tempo", f"{rate}"], ]
@@ -339,7 +338,7 @@ def generate(args):
                     noise_pred = wan_i2v_model([latent.to(device)], t=timestep, kv_cache=kv_cache[i],
                                                skip_audio=False if i in [1, 2] else False, **arg_c)[0]
 
-                    if args.audio_cfg>1.0 and i in [1, 2]:
+                    if args.audio_cfg > 1.0 and i in [1, 2]:
                         arg_null_audio = \
                             {'context': _context, 'clip_fea': clip_context, 'ref_target_masks': ref_target_masks,
                              'audio': torch.zeros_like(audio_embs), 'y': y_cut[:, :, sum(blksz_lst[:f]):sum(blksz_lst[:f + 1])],
@@ -381,6 +380,7 @@ def generate(args):
 
     if dist.is_initialized():
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     args = _parse_args()
