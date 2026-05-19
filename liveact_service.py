@@ -984,9 +984,10 @@ def serve_hls(task_id, filename):
     return send_from_directory(os.path.join(HLS_ROOT, task_id), filename)
 
 
-@app.route('/download/<task_id>')
-def download_video(task_id):
-    video_path = os.path.join(engine.video_save_root, f"{task_id}.mp4")
+@app.route('/download/<file_name>')
+def download_video(file_name):
+    # video_path = os.path.join(engine.video_save_root, f"{task_id}.mp4")
+    video_path = os.path.join(engine.video_save_root, file_name)
     if not os.path.exists(video_path):
         abort(404, description="Video file not found")
     return send_file(video_path, as_attachment=True, mimetype='video/mp4')
