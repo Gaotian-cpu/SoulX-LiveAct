@@ -802,7 +802,10 @@ class DistributedVideoEngine:
                         # 合并所有 chunk（时间维度拼接）
                         full_video = torch.cat(all_video_chunks, dim=2)   # [1, 3, T, H, W]
                         # 转换为 numpy 数组，值域 [0,1]，形状 [T, H, W, 3]
-                        video_np = ((full_video.squeeze(0).permute(1, 2, 3, 0) + 1.0) / 2).clamp(0, 1).cpu().numpy()
+                        video_np = ((full_video.squeeze(0).permute(1, 2, 3, 0).float() + 1.0) / 2)\
+                            .clamp(0, 1)\
+                            .cpu()\
+                            .numpy()
                         # 保存临时无声视频
                         temp_video_path = os.path.join(task_hls_dir, "temp_no_audio.mp4")
                         export_to_video(video_np, temp_video_path, fps=fps)
