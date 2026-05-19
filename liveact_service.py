@@ -18,7 +18,8 @@ import torchaudio
 import torchaudio.transforms as T
 from torchvision import transforms
 from PIL import Image
-from flask import Flask, render_template_string, send_from_directory, jsonify, request, render_template
+from flask import Flask, render_template_string, send_from_directory, jsonify, request, render_template, \
+    send_file, abort
 
 from lightx2v.models.video_encoders.hf.wan.vae import WanVAE as LightVAE
 from util_liveact import center_rescale_crop_keep_ratio, get_embedding, get_msk, get_audio_emb, add_audio_to_video
@@ -981,6 +982,14 @@ def start_stream():
 @app.route('/stream/<task_id>/<path:filename>')
 def serve_hls(task_id, filename):
     return send_from_directory(os.path.join(HLS_ROOT, task_id), filename)
+
+
+@app.route('/download/<task_id>')
+def download_video(task_id):
+    video_path = os.path.join(engine.video_save_root, f"{task_id}.mp4")
+    if not os.path.exists(video_path):
+        abort(404, description="Video file not found")
+    return send_file(video_path, as_attachment=True, mimetype='video/mp4')
 
 
 @app.route('/task_status/<task_id>', methods=['GET'])
