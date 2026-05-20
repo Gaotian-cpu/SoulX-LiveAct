@@ -449,7 +449,7 @@ class DistributedVideoEngine:
             # 获取语音时间戳（单位：秒）
             speech_timestamps = get_speech_timestamps(
                 audio_16k_np,
-                self.vad_model,
+                model=self.vad_model,
                 sampling_rate=16000,
                 threshold=0.5,                # 敏感度，可调
                 min_speech_duration_ms=250,
