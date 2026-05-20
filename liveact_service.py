@@ -437,18 +437,18 @@ class DistributedVideoEngine:
 
             # ========== VAD 处理：检测人声区间 ==========
             # 转换为单声道 numpy 数组 (silero-vad 要求 16kHz 单声道)
-            audio_mono = audio_ori.mean(dim=0) if audio_ori.shape[0] > 1 else audio_ori[0]
-            # 重采样到 16kHz（如果需要）
-            if sr_ori != 16000:
-                resampler_vad = T.Resample(sr_ori, 16000)
-                audio_16k = resampler_vad(audio_mono.unsqueeze(0)).squeeze(0)
-            else:
-                audio_16k = audio_mono
-            audio_16k_np = audio_16k.cpu().numpy()
+            # audio_mono = audio_ori.mean(dim=0) if audio_ori.shape[0] > 1 else audio_ori[0]
+            # # 重采样到 16kHz（如果需要）
+            # if sr_ori != 16000:
+            #     resampler_vad = T.Resample(sr_ori, 16000)
+            #     audio_16k = resampler_vad(audio_mono.unsqueeze(0)).squeeze(0)
+            # else:
+            #     audio_16k = audio_mono
+            # audio_16k_np = audio_16k.cpu().numpy()
 
             # 获取语音时间戳（单位：秒）
             speech_timestamps = get_speech_timestamps(
-                audio_16k_np,
+                audio_ori,
                 model=self.vad_model,
                 sampling_rate=16000,
                 threshold=0.3,                # 敏感度，可调
@@ -1169,6 +1169,12 @@ if __name__ == '__main__':
             ip = get_local_ip()
             print(f"\n🚀 LiveAct 服务启动!")
             print(f"访问地址: http://{ip}:{args.port}\n")
+
+            # 去掉请求日志
+            import logging
+            werkzeug_log = logging.getLogger('werkzeug')
+            werkzeug_log.addFilter(lambda record: '/task_status' not in record.getMessage())
+
             app.run(host='0.0.0.0', port=args.port, threaded=True, debug=False)
         else:
             print(f"节点 Rank {engine.rank} 等待指令...")
