@@ -451,8 +451,8 @@ class DistributedVideoEngine:
                 audio_16k_np,
                 model=self.vad_model,
                 sampling_rate=16000,
-                threshold=0.5,                # 敏感度，可调
-                min_speech_duration_ms=250,
+                threshold=0.3,                # 敏感度，可调
+                min_speech_duration_ms=100,
                 min_silence_duration_ms=100,
             )
 
