@@ -681,6 +681,17 @@ class DistributedVideoEngine:
                 print(f" - {stage:20}: {duration:.4f}s")
             print("=" * 30 + "\n")
 
+            # ========== 新增：定义动作 prompt（用于无人声段） ==========
+            # 添加动作 prompt（用于无人声段）
+            action_prompt = "a person smiling naturally, looking around, mouth closed, breathing gently"
+            action_context = [
+                self.text_encoder(
+                    texts=action_prompt,
+                    device='cpu' if self.args.t5_cpu else self.device
+                )[0].to(self.device, dtype=torch.bfloat16)
+            ]
+            # ===================================================
+
             # 4. 主循环
             iter_total_num = int(audio_len_sec / (self.vae_stride[0] * self.blksz_lst[-1] / fps)) + 1
             pre_latent = None
@@ -721,35 +732,42 @@ class DistributedVideoEngine:
                         has_speech = True
                         break
 
-                if not has_speech and iteration > 0:
-                    # 静音段且不是第一个 chunk：不调用模型，直接生成静态帧
-                    if self.rank == 0:
-                        # 获取上一 chunk 的最后一帧
-                        if all_video_chunks:
-                            last_frame = all_video_chunks[-1][:, :, -1:, :, :]   # [1,3,1,H,W]
-                        else:
-                            last_frame = cond_image.unsqueeze(0)                 # [1,3,1,H,W]
-                        # 当前 chunk 的帧数（非首块固定为 32 帧）
-                        chunk_frames = self.blksz_lst[1] * self.vae_stride[0]   # 8*4=32
-                        _videos = last_frame.repeat(1, 1, chunk_frames, 1, 1)
+                force_skip_audio = False
 
-                        all_video_chunks.append(_videos.cpu())
-                        update_task_status(
-                            task_id,
-                            status="running",
-                            stage="generating",
-                            message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk (静音段)",
-                            total_chunks=iter_total_num,
-                            generated_chunks=iteration + 1,
-                            is_done=False,
-                        )
-                        print(
-                            f"静音段 {iteration + 1}/{iter_total_num}, "
-                            f"跳过推理，使用静态帧，耗时:{time.perf_counter() - start_time:.4f}s",
-                            flush=True
-                        )
-                    # 跳过后续的音频 embedding 生成和模型推理
-                    continue
+                # if not has_speech and iteration > 0:
+                #     # 静音段且不是第一个 chunk：不调用模型，直接生成静态帧
+                #     if self.rank == 0:
+                #         # 获取上一 chunk 的最后一帧
+                #         if all_video_chunks:
+                #             last_frame = all_video_chunks[-1][:, :, -1:, :, :]   # [1,3,1,H,W]
+                #         else:
+                #             last_frame = cond_image.unsqueeze(0)                 # [1,3,1,H,W]
+                #         # 当前 chunk 的帧数（非首块固定为 32 帧）
+                #         chunk_frames = self.blksz_lst[1] * self.vae_stride[0]   # 8*4=32
+                #         _videos = last_frame.repeat(1, 1, chunk_frames, 1, 1)
+                #
+                #         all_video_chunks.append(_videos.cpu())
+                #         update_task_status(
+                #             task_id,
+                #             status="running",
+                #             stage="generating",
+                #             message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk (静音段)",
+                #             total_chunks=iter_total_num,
+                #             generated_chunks=iteration + 1,
+                #             is_done=False,
+                #         )
+                #         print(
+                #             f"静音段 {iteration + 1}/{iter_total_num}, "
+                #             f"跳过推理，使用静态帧，耗时:{time.perf_counter() - start_time:.4f}s",
+                #             flush=True
+                #         )
+                #     # 跳过后续的音频 embedding 生成和模型推理
+                #     continue
+                if not has_speech and iteration > 0:
+                    force_skip_audio = True
+                    cached_context = action_context   # 替换为动作描述
+                    if self.rank == 0:
+                        print(f"无人声段 {iteration+1}/{iter_total_num}，使用动作 prompt 并忽略音频")
                 # =============== VAD检测 ===============================
 
                 audio_embs = get_audio_emb(audio_embedding, audio_start_idx, audio_end_idx, self.device)
@@ -779,11 +797,19 @@ class DistributedVideoEngine:
                             'end_idx': sum(self.blksz_lst[:f_idx + 1]) * self.frame_len,
                             'update_cache': iteration > 1
                         }
+
+                        # 修改 skip_audio 参数
+                        if force_skip_audio:
+                            skip_audio = True
+                        else:
+                            skip_audio = False if i in [1, 2] else True
+
                         noise_pred = self.wan_i2v_model(
                             [latent],
                             t=timestep,
                             kv_cache=self.kv_cache[i],
-                            skip_audio=False if i in [1, 2] else True,
+                            # skip_audio=False if i in [1, 2] else True,
+                            skip_audio=skip_audio,
                             **arg_c
                         )[0]
                         dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
