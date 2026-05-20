@@ -29,6 +29,7 @@ from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from transformers import Wav2Vec2FeatureExtractor
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 import queue
+import silero_vad
 from silero_vad import get_speech_timestamps
 from datetime import timedelta
 import errno
@@ -121,7 +122,7 @@ class DistributedVideoEngine:
                                       ulysses_degree=self.world_size)
 
         # 加载核心生成模型 (Wan2.1)
-        if self.world_size>1:
+        if self.world_size > 1:
             from model_liveact.model_memory_sp import WanModel
         else:
             from model_liveact.model_memory import WanModel
@@ -184,8 +185,7 @@ class DistributedVideoEngine:
         kv_cache_device = self.device
         kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
         kv_scale_shape = (1, kv_cache_tokens, 40, 1)
-        self.kv_cache  = \
-            {
+        self.kv_cache = {
                 i: {
                     layer_id: {
                         'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
@@ -208,6 +208,9 @@ class DistributedVideoEngine:
         self.vae.model.eval()
         # self.vae.encode = torch.compile(self.vae.encode)
         self.vae.decode = torch.compile(self.vae.decode)
+
+        # 加载VAD模型，仅rank 0需要，但为了简单可以都加载
+        self.vad_model = silero_vad.load_silero_vad(onnx=False)   # 使用 PyTorch 版本
 
         # 预热
         print("开始预热")
@@ -446,6 +449,7 @@ class DistributedVideoEngine:
             # 获取语音时间戳（单位：秒）
             speech_timestamps = get_speech_timestamps(
                 audio_16k_np,
+                self.vad_model,
                 sampling_rate=16000,
                 threshold=0.5,                # 敏感度，可调
                 min_speech_duration_ms=250,
