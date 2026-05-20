@@ -1102,16 +1102,16 @@ def download_video(file_name):
     if not os.path.exists(video_path):
         abort(404, description="Video file not found")
 
-    delete = request.args.get('delete', '0')
-    if delete and delete != '0':
-        @after_this_request
-        def remove_file(response):
-            try:
-                print(u'删除文件：{}……'.format(video_path))
-                os.remove(video_path)
-            except Exception as e:
-                app.logger.error(f"Failed to delete file {video_path}: {e}")
-            return response
+    # delete = request.args.get('delete', '0')
+    # if delete and delete != '0':
+    #     @after_this_request
+    #     def remove_file(response):
+    #         try:
+    #             print(u'删除文件：{}……'.format(video_path))
+    #             os.remove(video_path)
+    #         except Exception as e:
+    #             app.logger.error(f"Failed to delete file {video_path}: {e}")
+    #         return response
 
     return send_file(video_path, as_attachment=True, mimetype='video/mp4')
 
