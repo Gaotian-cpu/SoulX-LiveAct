@@ -33,6 +33,13 @@ import silero_vad
 from silero_vad import get_speech_timestamps
 from datetime import timedelta
 import errno
+import logging
+
+def log_err(e):
+    logger = logging.getLogger('werkzeug')
+
+    logger.exception('', e)
+
 
 # ================= 1. 全局环境与配置 =================
 
@@ -1029,102 +1036,114 @@ def index():
 
 @app.route('/start_stream', methods=['POST'])
 def start_stream():
-    global streaming_active
+    try:
+        global streaming_active
 
-    if streaming_active:
-        return jsonify({"status": "error", "message": "GPU 任务繁忙，请稍后再试"}), 429
+        if streaming_active:
+            return jsonify({"status": "error", "message": "GPU 任务繁忙，请稍后再试"}), 429
 
-    task_id = request.form.get('task_id')
-    main_prompt = (request.form.get('main_prompt') or '').strip()
-    prompt_json = request.form.get('prompt_json') or '[]'
-    fps = request.form.get('fps')
-    prompt_list = json.loads(prompt_json)
-    output_mode = request.form.get('output_mode', 'stream')  # 默认流式
-    if output_mode not in ('stream', 'file'):
-        output_mode = 'stream'  # 非法值回退
+        task_id = request.form.get('task_id')
+        main_prompt = (request.form.get('main_prompt') or '').strip()
+        prompt_json = request.form.get('prompt_json') or '[]'
+        fps = request.form.get('fps')
+        prompt_list = json.loads(prompt_json)
+        output_mode = request.form.get('output_mode', 'stream')  # 默认流式
+        if output_mode not in ('stream', 'file'):
+            output_mode = 'stream'  # 非法值回退
 
-    stream_with_audio = str(request.form.get('stream_with_audio', 'false')).lower() in ('1', 'true', 'yes', 'on')
-    img_file = request.files.get('img_file')
-    audio_file = request.files.get('audio_file')
-    if not task_id:
-        return jsonify({"status": "error", "message": "缺少 task_id"}), 400
-    if not img_file or not audio_file:
-        return jsonify({"status": "error", "message": "缺少图片或音频文件"}), 400
-    if not fps:
-        return jsonify({"status": "error", "message": "缺少 fps"}), 400
-    task_upload_dir = os.path.join(UPLOAD_ROOT, task_id)
-    os.makedirs(task_upload_dir, exist_ok=True)
-    img_path = os.path.join(task_upload_dir, "input.png")
-    audio_path = os.path.join(task_upload_dir, "input.wav")
-    img_file.save(img_path)
-    audio_file.save(audio_path)
-    params = {
-        'task_id': task_id,
-        'prompt_list': prompt_list,
-        'main_prompt': main_prompt,
-        'fps': int(fps),
-        'img_path': img_path,
-        'audio_path': audio_path,
-        'stream_with_audio': stream_with_audio,
-        'output_mode': output_mode,   # 新增
-    }
+        stream_with_audio = str(request.form.get('stream_with_audio', 'false')).lower() in ('1', 'true', 'yes', 'on')
+        img_file = request.files.get('img_file')
+        audio_file = request.files.get('audio_file')
+        if not task_id:
+            return jsonify({"status": "error", "message": "缺少 task_id"}), 400
+        if not img_file or not audio_file:
+            return jsonify({"status": "error", "message": "缺少图片或音频文件"}), 400
+        if not fps:
+            return jsonify({"status": "error", "message": "缺少 fps"}), 400
+        task_upload_dir = os.path.join(UPLOAD_ROOT, task_id)
+        os.makedirs(task_upload_dir, exist_ok=True)
+        img_path = os.path.join(task_upload_dir, "input.png")
+        audio_path = os.path.join(task_upload_dir, "input.wav")
+        img_file.save(img_path)
+        audio_file.save(audio_path)
+        params = {
+            'task_id': task_id,
+            'prompt_list': prompt_list,
+            'main_prompt': main_prompt,
+            'fps': int(fps),
+            'img_path': img_path,
+            'audio_path': audio_path,
+            'stream_with_audio': stream_with_audio,
+            'output_mode': output_mode,   # 新增
+        }
 
-    update_task_status(
-        task_id,
-        status="queued",
-        stage="queued",
-        message="任务已入队，等待执行",
-        total_chunks=None,
-        generated_chunks=0,
-        is_done=False,
-        stream_ready=False,
-        error=None,
-        stream_with_audio=stream_with_audio, )
+        update_task_status(
+            task_id,
+            status="queued",
+            stage="queued",
+            message="任务已入队，等待执行",
+            total_chunks=None,
+            generated_chunks=0,
+            is_done=False,
+            stream_ready=False,
+            error=None,
+            stream_with_audio=stream_with_audio, )
 
-    streaming_active = True
-    task_queue.put(params)
-    return jsonify({
-        "status": "success",
-        "task_id": task_id,
-        "stream_with_audio": stream_with_audio
-    })
+        streaming_active = True
+        task_queue.put(params)
+        return jsonify({
+            "status": "success",
+            "task_id": task_id,
+            "stream_with_audio": stream_with_audio
+        })
+    except Exception as e:
+        log_err(e)
 
 
 @app.route('/stream/<task_id>/<path:filename>')
 def serve_hls(task_id, filename):
-    return send_from_directory(os.path.join(HLS_ROOT, task_id), filename)
+    try:
+        return send_from_directory(os.path.join(HLS_ROOT, task_id), filename)
+    except Exception as e:
+        log_err(e)
 
 
 @app.route('/download/<file_name>')
 def download_video(file_name):
-    # video_path = os.path.join(engine.video_save_root, f"{task_id}.mp4")
-    video_path = os.path.join(engine.video_save_root, file_name)
-    if not os.path.exists(video_path):
-        abort(404, description="Video file not found")
+    try:
+        # video_path = os.path.join(engine.video_save_root, f"{task_id}.mp4")
+        video_path = os.path.join(engine.video_save_root, file_name)
+        if not os.path.exists(video_path):
+            abort(404, description="Video file not found")
 
-    # delete = request.args.get('delete', '0')
-    # if delete and delete != '0':
-    #     @after_this_request
-    #     def remove_file(response):
-    #         try:
-    #             print(u'删除文件：{}……'.format(video_path))
-    #             os.remove(video_path)
-    #         except Exception as e:
-    #             app.logger.error(f"Failed to delete file {video_path}: {e}")
-    #         return response
+        # delete = request.args.get('delete', '0')
+        # if delete and delete != '0':
+        #     @after_this_request
+        #     def remove_file(response):
+        #         try:
+        #             print(u'删除文件：{}……'.format(video_path))
+        #             os.remove(video_path)
+        #         except Exception as e:
+        #             app.logger.error(f"Failed to delete file {video_path}: {e}")
+        #         return response
 
-    return send_file(video_path, as_attachment=True, mimetype='video/mp4')
+        return send_file(video_path, as_attachment=True, mimetype='video/mp4')
+    except Exception as e:
+        log_err(e)
 
 
 @app.route('/task_status/<task_id>', methods=['GET'])
 def task_status(task_id):
-    data = get_task_status(task_id)
-    if data is None:
-        return jsonify({
-            "status": "not_found",
-            "message": "task_id 不存在"
-        }), 404
-    return jsonify(data)
+    try:
+        data = get_task_status(task_id)
+        if data is None:
+            return jsonify({
+                "status": "not_found",
+                "message": "task_id 不存在"
+            }), 404
+        return jsonify(data)
+    except Exception as e:
+        log_err(e)
 
 
 # ================= 5. 分布式启动 =================
@@ -1171,7 +1190,7 @@ if __name__ == '__main__':
             print(f"访问地址: http://{ip}:{args.port}\n")
 
             # 去掉请求日志
-            import logging
+            # import logging
             werkzeug_log = logging.getLogger('werkzeug')
             werkzeug_log.addFilter(lambda record: '/task_status' not in record.getMessage())
 
