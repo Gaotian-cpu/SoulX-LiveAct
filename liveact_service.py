@@ -942,6 +942,7 @@ def start_stream():
         prompt_json = request.form.get('prompt_json') or '[]'
         fps = request.form.get('fps')
         prompt_list = json.loads(prompt_json)
+        print(u'收到prompt_list: {}'.format(prompt_list))
         output_mode = request.form.get('output_mode', 'stream')  # 默认流式
         if output_mode not in ('stream', 'file'):
             output_mode = 'stream'  # 非法值回退
