@@ -29,8 +29,6 @@ from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from transformers import Wav2Vec2FeatureExtractor
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 import queue
-import silero_vad
-from silero_vad import get_speech_timestamps
 from datetime import timedelta
 import errno
 import logging
@@ -215,9 +213,6 @@ class DistributedVideoEngine:
         self.vae.model.eval()
         # self.vae.encode = torch.compile(self.vae.encode)
         self.vae.decode = torch.compile(self.vae.decode)
-
-        # 加载VAD模型，仅rank 0需要，但为了简单可以都加载
-        self.vad_model = silero_vad.load_silero_vad(onnx=False)   # 使用 PyTorch 版本
 
         # 预热
         print("开始预热")
@@ -442,43 +437,6 @@ class DistributedVideoEngine:
 
             audio_ori, sr_ori = torchaudio.load(audio_path)
 
-            # ========== VAD 处理：检测人声区间 ==========
-            # 转换为单声道 numpy 数组 (silero-vad 要求 16kHz 单声道)
-            # audio_mono = audio_ori.mean(dim=0) if audio_ori.shape[0] > 1 else audio_ori[0]
-            # # 重采样到 16kHz（如果需要）
-            # if sr_ori != 16000:
-            #     resampler_vad = T.Resample(sr_ori, 16000)
-            #     audio_16k = resampler_vad(audio_mono.unsqueeze(0)).squeeze(0)
-            # else:
-            #     audio_16k = audio_mono
-            # audio_16k_np = audio_16k.cpu().numpy()
-
-            # 获取语音时间戳（单位：秒）
-            speech_timestamps = get_speech_timestamps(
-                audio_ori,
-                model=self.vad_model,
-                sampling_rate=16000,
-                threshold=0.3,                # 敏感度，可调
-                min_speech_duration_ms=100,
-                min_silence_duration_ms=100,
-            )
-
-            # 计算总帧数 (fps 是目标帧率)
-            total_frames = int(audio_ori.size(1) / sr_ori * fps)
-
-            # 初始化帧级别的人声标记
-            is_speech_frame = [False] * total_frames
-            for seg in speech_timestamps:
-                start_sec = seg['start'] / 16000.0
-                end_sec = seg['end'] / 16000.0
-                start_frame = int(start_sec * fps)
-                end_frame = int(end_sec * fps)
-                for f in range(start_frame, min(end_frame, total_frames)):
-                    is_speech_frame[f] = True
-            # 可选：保存到 self 或 params 中，供生成循环使用
-            # 注意：这里需要将 is_speech_frame 传递给后续循环，可以保存在一个变量中
-            # ========== VAD 处理结束 ==========
-
             audio_resampled, _ = resample_audio(audio_ori, sr_ori, fps)
             audio_embedding = get_embedding(
                 audio_resampled[0],
@@ -688,17 +646,6 @@ class DistributedVideoEngine:
                 print(f" - {stage:20}: {duration:.4f}s")
             print("=" * 30 + "\n")
 
-            # ========== 新增：定义动作 prompt（用于无人声段） ==========
-            # 添加动作 prompt（用于无人声段）
-            action_prompt = "a person smiling naturally, looking around, mouth closed, breathing gently"
-            action_context = [
-                self.text_encoder(
-                    texts=action_prompt,
-                    device='cpu' if self.args.t5_cpu else self.device
-                )[0].to(self.device, dtype=torch.bfloat16)
-            ]
-            # ===================================================
-
             # 4. 主循环
             iter_total_num = int(audio_len_sec / (self.vae_stride[0] * self.blksz_lst[-1] / fps)) + 1
             pre_latent = None
@@ -727,55 +674,6 @@ class DistributedVideoEngine:
 
                 audio_start_idx = 0 if iteration == 0 else (iteration - 1) * self.blksz_lst[-1] * self.vae_stride[0]
                 audio_end_idx = audio_start_idx + frame_num_init
-
-                # ========== VAD 检测：当前 chunk 是否包含人声 ==========
-                start_sec = audio_start_idx / sr_ori
-                end_sec = audio_end_idx / sr_ori
-                has_speech = False
-                for seg in speech_timestamps:
-                    seg_start = seg['start'] / 16000.0
-                    seg_end = seg['end'] / 16000.0
-                    if max(start_sec, seg_start) < min(end_sec, seg_end):
-                        has_speech = True
-                        break
-
-                force_skip_audio = False
-
-                # if not has_speech and iteration > 0:
-                #     # 静音段且不是第一个 chunk：不调用模型，直接生成静态帧
-                #     if self.rank == 0:
-                #         # 获取上一 chunk 的最后一帧
-                #         if all_video_chunks:
-                #             last_frame = all_video_chunks[-1][:, :, -1:, :, :]   # [1,3,1,H,W]
-                #         else:
-                #             last_frame = cond_image.unsqueeze(0)                 # [1,3,1,H,W]
-                #         # 当前 chunk 的帧数（非首块固定为 32 帧）
-                #         chunk_frames = self.blksz_lst[1] * self.vae_stride[0]   # 8*4=32
-                #         _videos = last_frame.repeat(1, 1, chunk_frames, 1, 1)
-                #
-                #         all_video_chunks.append(_videos.cpu())
-                #         update_task_status(
-                #             task_id,
-                #             status="running",
-                #             stage="generating",
-                #             message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk (静音段)",
-                #             total_chunks=iter_total_num,
-                #             generated_chunks=iteration + 1,
-                #             is_done=False,
-                #         )
-                #         print(
-                #             f"静音段 {iteration + 1}/{iter_total_num}, "
-                #             f"跳过推理，使用静态帧，耗时:{time.perf_counter() - start_time:.4f}s",
-                #             flush=True
-                #         )
-                #     # 跳过后续的音频 embedding 生成和模型推理
-                #     continue
-                if not has_speech and iteration > 0:
-                    force_skip_audio = True
-                    cached_context = action_context   # 替换为动作描述
-                    if self.rank == 0:
-                        print(f"无人声段 {iteration+1}/{iter_total_num}，使用动作 prompt 并忽略音频")
-                # =============== VAD检测 ===============================
 
                 audio_embs = get_audio_emb(audio_embedding, audio_start_idx, audio_end_idx, self.device)
 
@@ -806,10 +704,7 @@ class DistributedVideoEngine:
                         }
 
                         # 修改 skip_audio 参数
-                        if force_skip_audio:
-                            skip_audio = True
-                        else:
-                            skip_audio = False if i in [1, 2] else True
+                        skip_audio = False if i in [1, 2] else True
 
                         noise_pred = self.wan_i2v_model(
                             [latent],
